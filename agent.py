@@ -1,276 +1,235 @@
 #!/usr/bin/env python3
-"""
-Filename: security_agent.py
-Created Date: Tuesday, July 8th 2025
-Author: ChatGPT
-@Modified By: ChatGPT, 2025-07-08. Added TreeAnalyzer agent and ExtractKeyFiles action.
-"""
 
 import asyncio
+import json
 import platform
+import os
+import fire
 from typing import Any
 
-import fire
 from metagpt.actions import Action
-from metagpt.schema import Message
 from metagpt.roles import Role
 from metagpt.team import Team
+from metagpt.schema import Message
+from metagpt.const import USER_REQUIREMENT  # 导入标准的 UserRequirement
 
+# ===================================================================
+# 1. 动作 (Actions) - 按执行顺序列出
+# ===================================================================
 
-class HandOut(Action):
-    """Action: read user repo_path and compose initial instruction for Director."""
+class PrepareTree(Action):
+    """Action: 读取树文件内容，为下一步做准备。这是一个非 LLM 的工具性 Action。"""
+    name: str = "PrepareTree"
+
+    async def run(self, tree_file_path: str) -> str:
+        print(f"🔩 Action: Reading tree file from '{tree_file_path}'...")
+        try:
+            with open(tree_file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            print(f"❌ ERROR: Tree file not found at {tree_file_path}")
+            return ""
+
+class ParseTreeToFilePaths(Action):
+    """Action: 解析树状文本，提取所有文件路径。这是一个非 LLM 的工具性 Action。"""
+    name: str = "ParseTreeToFilePaths"
+
+    async def run(self, tree_text: str) -> list[str]:
+        print("🌳 Action: Parsing tree text to file paths...")
+        files = []
+        path_stack = []
+        # 假设第一行是根目录，我们从第二行开始解析
+        lines = tree_text.strip().splitlines()[1:]
+
+        for line in lines:
+            depth = line.count('│   ') + line.count('    ')
+            
+            if "├── " in line:
+                name = line.split("├── ")[-1]
+            elif "└── " in line:
+                name = line.split("└── ")[-1]
+            else:
+                continue
+
+            while len(path_stack) > depth:
+                path_stack.pop()
+
+            # 简单的文件判断逻辑
+            is_file = '.' in name and not name.startswith('.') and not line.strip().endswith('/')
+
+            if is_file:
+                full_path = os.path.join(*path_stack, name)
+                files.append(full_path.replace('\\', '/'))
+            else:
+                path_stack.append(name)
+        
+        print(f"✅ Action: Found {len(files)} files.")
+        return files
+
+class AnalyzeSourceCode(Action):
+    """Action: (LLM-based) 分析单个源文件以查找安全漏洞。"""
     PROMPT_TEMPLATE: str = """
-Based on the provided repository path: {repo_path},
-please generate an instruction for the Hacker Director:
-1. You are the Hacker Director, coordinating the multi-agent vulnerability detection workflow.
-2. Issue a clear requirement to the Analyser in the format:
-   "The requirement is in directory '{repo_path}'. You are a professional Rust analyser;
-    please analyze the code for potential security vulnerabilities and highlight key files
-    needing further inspection."
+You are a top-tier security expert analyzing the file `{file_path}`.
+
+**Full Source Code**:
+{source_code}
+
+**Project Context**: 
+The full project tree has been provided in earlier steps. This file is one of several key files selected for analysis. Use your expertise to identify potential security vulnerabilities within THIS file's source code. Pay special attention to:
+- Input validation, SQL injection, XSS.
+- Integer overflow/underflow, unsafe memory operations, race conditions.
+- Hardcoded secrets, authorization issues, logical flaws.
+
+Provide a concise and actionable report for `{file_path}` in markdown format. If no significant vulnerabilities are found, state that clearly.
 """
-    name: str = "HandOut"
+    name: str = "AnalyzeSourceCode"
 
-    async def run(self, context: str, repo_path: str) -> str:
-        prompt = self.PROMPT_TEMPLATE.format(repo_path=repo_path)
-        response = await self._aask(prompt)
-        return response
+    async def run(self, file_path: str, source_code: str) -> str:
+        prompt = self.PROMPT_TEMPLATE.format(file_path=file_path, source_code=source_code)
+        return await self._aask(prompt)
 
-
-class SpeakAloud(Action):
-    """Action: speak out loud the given context from one role to another."""
-    PROMPT_TEMPLATE: str = """
-## CONTEXT
-{context}
-
-## YOUR TURN
-You are {name}. Speak this instruction clearly to {opponent_name}:
-"""
-    name: str = "SpeakAloud"
-
-    async def run(self, context: str, name: str, opponent_name: str) -> str:
-        prompt = self.PROMPT_TEMPLATE.format(
-            context=context, name=name, opponent_name=opponent_name
-        )
-        response = await self._aask(prompt)
-        return f"[{name}] {response}"
-
-
-class AnalyseTree(Action):
-    """Action: scan the project tree for vulnerabilities and key files."""
-    PROMPT_TEMPLATE: str = """
-You are a professional Rust security analyser. Here is the project tree to review:
-
-{tree}
-
-Please:
-1. Identify potential security issues (e.g. unsafe block misuse, concurrency flaws, panic propagation, dependency CVEs).
-2. List the key files requiring deeper inspection, with a brief rationale for each.
-3. Summarize your findings in concise bullet points.
-"""
-    name: str = "AnalyseTree"
-
-    async def run(self, context: str, tree: str) -> str:
-        prompt = self.PROMPT_TEMPLATE.format(tree=tree)
-        result = await self._aask(prompt)
-        return result
-
-
-class ExtractKeyFiles(Action):
-    """Action: simulate human-hacker reasoning over the tree to pick key files."""
-    PROMPT_TEMPLATE: str = """
-You are simulating a human hacker reviewing a project's directory tree. Here is the tree:
-
-{tree}
-
-Based on hacker intuition and threat modeling, list the files that require deep security analysis first.
-Provide only the relative file paths, one per line.
-"""
-    name: str = "ExtractKeyFiles"
-
-    async def run(self, context: str, tree: str) -> str:
-        prompt = self.PROMPT_TEMPLATE.format(tree=tree)
-        result = await self._aask(prompt)
-        return result
-
+# ===================================================================
+# 2. 角色 (Roles) - 按执行顺序列出
+# ===================================================================
 
 class Coordinator(Role):
-    """Coordinator: accepts repo_path and dispatches HandOut."""
-    def __init__(self, **data: Any):
-        super().__init__(**data)
-        self.set_actions([HandOut])
-        self._watch([HandOut])
+    """角色1: 启动器。接收用户需求，并启动树文件准备工作。"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_actions([PrepareTree])
+        self._watch([USER_REQUIREMENT]) # **关键**: 监听框架的初始消息
 
-    async def _observe(self) -> int:
-        await super()._observe()
-        return len(self.rc.news)
-
-    async def _act(self):
-        todo = self.rc.todo               # HandOut Action instance
-        repo_path = self.rc.news[-1].content
-        instruction = await todo.run(context="", repo_path=repo_path)
-        msg = Message(
-            content=instruction,
-            role="coordination",
-            sent_from=self.name,
-            send_to="Director"
-        )
-        self.rc.memory.add(msg)
-        return msg
+    async def _act(self) -> Message:
+        print("--- Role: Coordinator starting ---")
+        # 获取由 team.run(idea=...) 产生的初始消息
+        idea = self.rc.news[0].content
+        # 解析初始 idea (我们将其设计为 JSON 字符串)
+        try:
+            context = json.loads(idea)
+            tree_file = context.get("tree_file")
+        except (json.JSONDecodeError, AttributeError):
+            raise ValueError("The initial idea for the Coordinator must be a valid JSON string with a 'tree_file' key.")
+        
+        # 运行自己的动作
+        tree_text = await self.rc.todo.run(tree_file_path=tree_file)
+        
+        # **关键**: 发布新消息，触发下一个角色
+        return Message(content=tree_text, cause_by=PrepareTree)
 
 
 class TreeAnalyzer(Role):
-    """TreeAnalyzer: reads the tree text, extracts key files, then speaks aloud."""
-    def __init__(self, **data: Any):
-        super().__init__(**data)
-        self.set_actions([ExtractKeyFiles, SpeakAloud])
-        self._watch([ExtractKeyFiles, SpeakAloud])
+    """角色2: 解析器。接收树文件内容，解析出文件列表。"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_actions([ParseTreeToFilePaths])
+        self._watch([PrepareTree]) # **关键**: 监听上一个角色的动作
 
-    async def _observe(self) -> int:
-        await super()._observe()
-        return len(self.rc.news)
+    async def _act(self) -> Message:
+        print("--- Role: TreeAnalyzer starting ---")
+        tree_text = self.rc.news[0].content
+        file_list = await self.rc.todo.run(tree_text=tree_text)
 
-    async def _act(self):
-        todo = self.rc.todo
-        tree_text = self.rc.news[-1].content
+        # 保存文件列表以供下一个角色使用
+        os.makedirs("memory", exist_ok=True)
+        with open("memory/risk.json", "w", encoding="utf-8") as f:
+            json.dump(file_list, f, indent=2)
 
-        if isinstance(todo, ExtractKeyFiles):
-            key_list = await todo.run(context="", tree=tree_text)
-            # 先把关键文件列表发给 Director
-            msg = Message(
-                content=key_list,
-                role="keyfiles",
-                sent_from=self.name,
-                send_to="Director"
-            )
-            self.rc.memory.add(msg)
-            # 紧接着朗读一遍
-            speaker = SpeakAloud()
-            spoken = await speaker.run(
-                context=key_list, name=self.name, opponent_name="Director"
-            )
-            msg2 = Message(
-                content=spoken,
-                role="keyfiles-spoken",
-                sent_from=self.name,
-                send_to="Director"
-            )
-            self.rc.memory.add(msg2)
-            return msg2
-        return None
+        # **关键**: 发布新消息，触发下一个角色
+        return Message(content=json.dumps(file_list), cause_by=ParseTreeToFilePaths)
 
+class SecurityExpert(Role):
+    """角色3: 安全专家。接收文件列表并逐一分析。"""
+    def __init__(self, repo_path: str, **kwargs):
+        super().__init__(**kwargs)
+        self.repo_path = repo_path
+        self.set_actions([AnalyzeSourceCode])
+        self._watch([ParseTreeToFilePaths]) # **关键**: 监听上一个角色的动作
+        self.files_to_analyze = []
+        self.analysis_reports = []
+
+    async def _act(self) -> Message:
+        print("--- Role: SecurityExpert starting ---")
+        
+        # 首次被激活时，从消息中加载待办列表
+        if not self.files_to_analyze:
+            file_list_json = self.rc.news[0].content
+            self.files_to_analyze = json.loads(file_list_json)
+
+        # 如果还有文件待分析
+        if self.files_to_analyze:
+            file_path = self.files_to_analyze.pop(0)
+            print(f"🕵️  Analyzing file: {file_path} ({len(self.files_to_analyze)} remaining)")
+            
+            full_path = os.path.join(self.repo_path, file_path)
+            try:
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    source_code = f.read()
+                
+                # 运行分析动作
+                report = await self.rc.todo.run(file_path=file_path, source_code=source_code)
+                self.analysis_reports.append(report)
+            except Exception as e:
+                error_report = f"### Analysis for {file_path}\n\n[ERROR] Failed to analyze file: {e}"
+                self.analysis_reports.append(error_report)
+
+            # **关键**: 给自己发消息以继续处理下一个文件
+            # 如果还有文件，继续触发自己；否则，流程会自然结束
+            if self.files_to_analyze:
+                 return Message(content=json.dumps(self.files_to_analyze), cause_by=ParseTreeToFilePaths, send_to=self.name)
+
+        # 所有文件分析完毕，发布最终报告
+        print("✅ All files analyzed. Compiling final report.")
+        final_report = "\n\n---\n\n".join(self.analysis_reports)
+        return Message(content=final_report, cause_by=AnalyzeSourceCode, send_to="Director") # 假设有 Director 接收
 
 class Director(Role):
-    """Hacker Director: instructs Analyser and finally reports to user."""
-    def __init__(self, **data: Any):
-        super().__init__(**data)
-        self.set_actions([SpeakAloud])
-        self._watch([HandOut, SpeakAloud])
+    """角色4: 主管。接收并打印最终报告。"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._watch([AnalyzeSourceCode]) # **关键**: 监听 SecurityExpert 的最终动作
 
-    async def _observe(self) -> int:
-        await super()._observe()
-        return len(self.rc.news)
-
-    async def _act(self):
-        todo = self.rc.todo            # SpeakAloud Action instance
-        context = self.rc.news[-1].content
-
-        # Coordinator → Director 转述给 Analyser
-        if self.rc.news[-1].sent_from == "Coordinator" or self.rc.news[-1].sent_from == "TreeAnalyzer":
-            spoken = await todo.run(
-                context=context, name=self.name, opponent_name="Analyser"
-            )
-            msg = Message(
-                content=spoken,
-                role="direction",
-                sent_from=self.name,
-                send_to="Analyser"
-            )
-            self.rc.memory.add(msg)
-            return msg
-
-        # Analyser → Director 最终报告给 User
-        elif self.rc.news[-1].sent_from == "Analyser":
-            report = await todo.run(
-                context=context, name=self.name, opponent_name="User"
-            )
-            print("\nSecurity Analysis Report:\n", report)
-            msg = Message(
-                content=report,
-                role="report",
-                sent_from=self.name,
-                send_to="User"
-            )
-            self.rc.memory.add(msg)
-            return msg
+    async def _act(self) -> Message:
+        print("--- Role: Director starting ---")
+        final_report = self.rc.news[0].content
+        print("\n======================= FINAL SECURITY REPORT =======================")
+        print(final_report)
+        print("=====================================================================")
+        # 流程结束
+        return Message(content="Analysis complete.", cause_by=self.rc.todo)
 
 
-class Analyser(Role):
-    """Rust Analyser: runs AnalyseTree then SpeakAloud."""
-    def __init__(self, **data: Any):
-        super().__init__(**data)
-        self.set_actions([AnalyseTree, SpeakAloud])
-        self._watch([AnalyseTree, SpeakAloud])
+# ===================================================================
+# 3. 主流程 (Pipeline)
+# ===================================================================
 
-    async def _observe(self) -> int:
-        await super()._observe()
-        return len(self.rc.news)
+async def pipeline(repo_path: str, tree_file: str, n_round: int = 20):
+    """(重构版) 仅负责组建团队和启动流程。"""
+    team = Team(
+        roles=[
+            Coordinator(name="Coordinator"),
+            TreeAnalyzer(name="TreeAnalyzer"),
+            SecurityExpert(name="SecurityExpert", repo_path=repo_path),
+            Director(name="Director"),
+        ]
+    )
 
-    async def _act(self):
-        todo = self.rc.todo
-        last_content = self.rc.news[-1].content
+    # 将所有初始信息打包成一个 JSON 字符串作为 "idea"
+    initial_context = {
+        "repo_path": repo_path,
+        "tree_file": tree_file
+    }
 
-        # AnalyseTree → 生成分析结果并发给 Director
-        if isinstance(todo, AnalyseTree):
-            analysis = await todo.run(context="", tree=last_content)
-            msg = Message(
-                content=analysis,
-                role="analysis",
-                sent_from=self.name,
-                send_to="Director"
-            )
-            self.rc.memory.add(msg)
-            # SpeakAloud
-            speaker = SpeakAloud()
-            spoken = await speaker.run(
-                context=analysis, name=self.name, opponent_name="Director"
-            )
-            msg2 = Message(
-                content=spoken,
-                role="analysis-spoken",
-                sent_from=self.name,
-                send_to="Director"
-            )
-            self.rc.memory.add(msg2)
-            return msg2
-        return None
+    print("--- Starting Security Analysis Pipeline (v5 - Refactored) ---")
+    
+    await team.run(idea=json.dumps(initial_context), n_round=n_round)
+    
+    print("--- Security Analysis Pipeline Finished ---")
 
-
-async def pipeline(repo_path: str, tree_file: str, n_round: int = 8):
-    coord = Coordinator(name="Coordinator")
-    tree_agent = TreeAnalyzer(name="TreeAnalyzer")
-    direc = Director(name="Director")
-    analy = Analyser(name="Analyser")
-    team = Team(use_mgx=False)
-    team.hire([coord, tree_agent, direc, analy])
-
-    # 1) 发 repo_path 给 Coordinator
-    team.run_project(repo_path, send_to="Coordinator")
-
-    # 2) 读取 tree_file，并发给 TreeAnalyzer
-    with open(tree_file, 'r', encoding='utf-8') as f:
-        tree_text = f.read()
-    team.run_project(tree_text, send_to="TreeAnalyzer")
-
-    # 3) 异步多轮，完成 HandOut→Director→AnalyseTree→TreeAnalyzer→Director 全链路
-    await team.run(n_round=n_round)
-
-
-def main(repo_path: str, tree_file: str, n_round: int = 8):
-    """CLI entry: specify repo_path, tree_file, and optional n_round."""
+def main(repo_path: str, tree_file: str, n_round: int = 20):
+    """CLI entry point."""
     if platform.system() == "Windows":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(pipeline(repo_path, tree_file, n_round))
-
 
 if __name__ == "__main__":
     fire.Fire(main)
