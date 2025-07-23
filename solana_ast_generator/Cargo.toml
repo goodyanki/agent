@@ -1,0 +1,24 @@
+[package]
+name = "solana_ast_generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 用于构建专业的命令行界面
+clap = { version = "4.5.8", features = ["derive"] }
+
+# 核心 tree-sitter 库
+tree-sitter = "0.22.6" # 请使用较新版本以确保兼容性
+
+# 各语言的 tree-sitter 语法库
+# 注意：版本应与核心库匹配
+tree-sitter-rust = "0.21.0"
+tree-sitter-typescript = "0.21.0"
+tree-sitter-javascript = "0.21.0"
+
+# 用于高效遍历目录
+walkdir = "2.5.0"
+
+# 用于将AST序列化为JSON
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.120"

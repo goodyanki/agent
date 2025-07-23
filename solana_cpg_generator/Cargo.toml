@@ -1,0 +1,18 @@
+[package]
+name = "solana_cpg_generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 核心编译器驱动
+rustc_driver = "0.0.0"
+rustc_interface = "0.0.0"
+
+# 访问编译器内部数据结构，如TyCtxt和MIR
+rustc_middle = "0.0.0"
+rustc_hir = "0.0.0"
+rustc_session = "0.0.0"
+rustc_span = "0.0.0"
+
+# 命令行参数解析
+clap = { version = "4.5.8", features = ["derive"] }
